@@ -133,6 +133,12 @@ let micResponding = false;
 let micRespondingAt = 0;
 let micChunkCount = 0;
 let micLastLogTs = 0;
+
+// Speech detection state for robust interrupt triggering
+let speechFrameCount = 0; // Count of consecutive frames above threshold
+const SPEECH_FRAMES_REQUIRED = 4; // Require multiple frames of speech before interrupt
+const SPEECH_RMS_THRESHOLD = 0.04; // Higher threshold to avoid ambient noise triggers
+let lastSpeechDetectedAt = 0; // Track when we last detected speech
 let wasMicListeningBeforePause = false;
 let isBackendReady = false;
 let hasSentMicAudio = false;
@@ -612,10 +618,14 @@ const ensureRealtimeSocket = async () => {
         }
         
         // Handle input audio buffer speech detection (server-side VAD detected speech)
+        // Only interrupt if the agent is actively responding - this prevents
+        // false triggers from ambient noise that the server's VAD may pick up
         if (type === "input_audio_buffer.speech_started") {
-          console.debug("[voice] VAD speech detected, interrupting playback");
-          if (micResponding) {
+          if (micResponding && activeAudioSources.length > 0) {
+            console.debug("[voice] server-side VAD speech detected, interrupting playback");
             cancelCurrentResponse();
+          } else {
+            console.debug("[voice] server-side VAD speech detected but not interrupting (no active playback)");
           }
         }
         
@@ -866,6 +876,9 @@ const cancelCurrentResponse = async () => {
   micResponding = false;
   micRespondingAt = 0;
   
+  // Reset speech detection state
+  speechFrameCount = 0;
+  
   // Send cancel event to the server (don't await - fire and forget for speed)
   sendMicEvent("response.cancel");
   sendMicEvent("input_audio_buffer.clear");
@@ -1081,6 +1094,10 @@ const stopMicCapture = async () => {
     // Stop any ongoing playback
     stopAllPlayback();
     
+    // Reset speech detection state
+    speechFrameCount = 0;
+    lastSpeechDetectedAt = 0;
+    
     if (micProcessor) {
       micProcessor.disconnect();
       micProcessor.onaudioprocess = null;
@@ -1160,18 +1177,36 @@ const startMicCapture = async () => {
     const inputBuffer = event.inputBuffer.getChannelData(0);
     
     // Client-side speech detection: check if there's significant audio energy
-    // This triggers interrupt faster than waiting for server-side VAD
+    // Use sustained detection - require multiple consecutive frames above threshold
+    // to avoid false triggers from transient noise
     if (micResponding) {
       let sumSquares = 0;
       for (let i = 0; i < inputBuffer.length; i++) {
         sumSquares += inputBuffer[i] * inputBuffer[i];
       }
       const rms = Math.sqrt(sumSquares / inputBuffer.length);
-      // If RMS is above threshold, user is likely speaking - interrupt immediately
-      if (rms > 0.02) {
-        console.debug("[mic] client-side speech detected (RMS:", rms.toFixed(4), ") - interrupting");
-        cancelCurrentResponse();
+      
+      if (rms > SPEECH_RMS_THRESHOLD) {
+        speechFrameCount += 1;
+        lastSpeechDetectedAt = Date.now();
+        
+        // Only trigger interrupt if we've had sustained speech for multiple frames
+        if (speechFrameCount >= SPEECH_FRAMES_REQUIRED) {
+          console.debug("[mic] sustained speech detected (RMS:", rms.toFixed(4), ", frames:", speechFrameCount, ") - interrupting");
+          speechFrameCount = 0; // Reset after interrupt
+          cancelCurrentResponse();
+        }
+      } else {
+        // Reset frame count if we drop below threshold
+        // Allow brief dips by only resetting if we've been quiet for a while
+        const quietDuration = Date.now() - lastSpeechDetectedAt;
+        if (quietDuration > 150) { // 150ms grace period for natural speech pauses
+          speechFrameCount = 0;
+        }
       }
+    } else {
+      // Not responding, reset speech detection state
+      speechFrameCount = 0;
     }
     
     const downsampled = downsampleBuffer(
